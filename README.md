@@ -1,17 +1,23 @@
 # local-voice
 
-Fully local voice assistant running on Apple Silicon. No cloud APIs, 100% private.
+Fully local voice assistant. No cloud APIs, 100% private.
 
-**Pipeline:** Microphone → MLX-Whisper (STT) → Ollama (LLM) → Kokoro (TTS) → Speaker
+**Pipeline:** Microphone → Whisper (STT) → Ollama (LLM) → Kokoro (TTS) → Speaker
 
-## Requirements
+Two versions:
+- **Mac** (`voice_assistant.py`) — MLX-Whisper on Apple Silicon
+- **PC** (`voice_assistant_pc.py`) — faster-whisper on Windows
+
+## Mac Setup
+
+### Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
 - Python 3.12+
-- [Ollama](https://ollama.com) with `qwen2.5:7b` or `qwen2.5:32b`
+- [Ollama](https://ollama.com) with `qwen3:14b` or `qwen3:32b`
 - [Homebrew](https://brew.sh)
 
-## Install
+### Install
 
 ```bash
 # System dependency
@@ -22,8 +28,9 @@ python3 -m venv ~/ai-env
 source ~/ai-env/bin/activate
 pip install mlx-whisper sounddevice kokoro-onnx httpx numpy
 
-# Pull an Ollama model
-ollama pull qwen2.5:7b
+# Pull Ollama models
+ollama pull qwen3:14b
+ollama pull qwen3:32b  # optional, for "powerful" mode
 
 # Download Kokoro TTS model files
 mkdir -p ~/ai-env/models
@@ -32,17 +39,51 @@ curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-fil
 curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 ```
 
-## Usage
+### Usage
 
 ```bash
-# Quick start
-./start-assistant.sh
+./start-assistant.sh                        # default (qwen3:14b, push-to-talk)
+./start-assistant.sh --model qwen3:32b      # more powerful model
+./start-assistant.sh --vad                  # hands-free mode with wake word
+./start-assistant.sh --vad --no-wake        # hands-free without wake word
+./start-assistant.sh --voice af_bella       # different voice
+./start-assistant.sh --speed 1.2            # faster speech
+```
 
-# Options
-python voice_assistant.py --model qwen2.5:32b   # use larger model
-python voice_assistant.py --vad                   # hands-free mode
-python voice_assistant.py --voice af_bella        # different voice
-python voice_assistant.py --speed 1.2             # faster speech
+## PC (Windows) Setup
+
+### Requirements
+
+- Windows 10/11
+- Python 3.10+
+- [Ollama for Windows](https://ollama.com) with `qwen3:8b`
+- ~16GB RAM recommended
+
+### Install
+
+Option A — run `setup-pc.bat` (does everything automatically).
+
+Option B — manual:
+
+```cmd
+python -m venv venv
+venv\Scripts\activate.bat
+pip install -r requirements-pc.txt
+
+mkdir models
+curl -L -o models\kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -L -o models\voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+
+ollama pull qwen3:8b
+```
+
+### Usage
+
+```cmd
+start-assistant-pc.bat                      # default (qwen3:8b, push-to-talk)
+start-assistant-pc.bat --vad                # hands-free mode
+start-assistant-pc.bat --model qwen3:14b    # if you have more RAM
+start-assistant-pc.bat --voice af_bella     # different voice
 ```
 
 ## Keyboard Controls
@@ -59,6 +100,16 @@ python voice_assistant.py --speed 1.2             # faster speech
 | `s` | Save conversation to file |
 | `q` | Quit |
 
+## Features
+
+- **Streaming TTS** — starts speaking the first sentence while the LLM is still generating
+- **Voice interrupt** — in hands-free mode, speaking into the mic cuts off TTS playback
+- **Wake word** — say "Voice mode" to activate in hands-free mode (configurable)
+- **Conversation memory** — auto-summarizes older exchanges to stay within context limits
+- **Audio chimes** — subtle tones for recording start/stop feedback
+- **Echo cancellation** — mic muted briefly after TTS to prevent self-triggering
+- **File operations** — ask the assistant to save notes, logs, or documents to disk
+
 ## Voices
 
 28 voices available, sorted by quality. Top voices:
@@ -69,7 +120,3 @@ python voice_assistant.py --speed 1.2             # faster speech
 | `af_bella` | A- | American female |
 | `af_nicole` | B- | American female |
 | `bf_emma` | B- | British female |
-
-## File Operations
-
-Ask the assistant to save files and it will write them to `~/Documents/assistant-output/` by default. It can also write to Google Drive or OneDrive cloud storage paths.

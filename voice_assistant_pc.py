@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""Local Voice Assistant — mic → MLX-Whisper STT → Ollama → Kokoro TTS → speaker.
+"""Local Voice Assistant (Windows PC version) — mic → faster-whisper STT → Ollama → Kokoro TTS → speaker.
 
 Features:
   - Streaming TTS: starts speaking first sentence while LLM still generates
   - Voice interrupt: in hands-free mode, speaking into mic cuts off TTS
   - ESC interrupt: press Escape to skip speech in push-to-talk mode
-  - Wake word: say "Computer" to activate in hands-free mode
+  - Wake word: say "Voice mode" to activate in hands-free mode
   - Conversation memory: auto-summarizes old exchanges to stay within context
   - Audio chimes: subtle tones for recording start/stop feedback
   - Echo cancellation: mic muted briefly after TTS to prevent self-triggering
+
+Requires: faster-whisper, sounddevice, kokoro-onnx, httpx, numpy
 """
 
 import argparse
 import json
 import math
+import msvcrt
 import os
 import queue
 import re
-import select
 import sys
-import termios
 import threading
 import time
-import tty
 from pathlib import Path
 
 import httpx
@@ -38,14 +38,14 @@ DTYPE = "int16"
 SILENCE_THRESHOLD = 500  # RMS threshold for VAD
 SILENCE_TIMEOUT = 1.5  # seconds of silence before stopping
 MIN_SPEECH_DURATION = 0.3  # minimum seconds to consider as speech
-INTERRUPT_RMS = 800  # mic RMS to trigger voice interrupt (higher than VAD to avoid echo)
-ECHO_COOLDOWN = 0.5  # seconds to mute mic after TTS finishes (echo cancellation)
+INTERRUPT_RMS = 800  # mic RMS to trigger voice interrupt
+ECHO_COOLDOWN = 0.5  # seconds to mute mic after TTS finishes
 MAX_HISTORY_PAIRS = 20  # max user/assistant exchanges before summarizing
 
 WAKE_WORD = "voice mode"
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+WHISPER_MODEL = "large-v3-turbo"
 
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "assistant-output"
 
@@ -57,7 +57,10 @@ THINK_PATTERN = re.compile(
 )
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
-SYSTEM_PROMPT = """\
+# Build user-home prefix for file safety check
+ALLOWED_PREFIX = str(Path.home()).replace("\\", "/") + "/"
+
+SYSTEM_PROMPT = f"""\
 You are a local research assistant for a scientist. You help with:
 - Project planning, scheduling, and experiment tracking
 - Hypothesis discussion and brainstorming
@@ -66,11 +69,9 @@ You are a local research assistant for a scientist. You help with:
 
 When the user asks you to write, save, create, or log something to a file,
 respond with a <<FILE_OP>> block containing a JSON object:
-<<FILE_OP>>{"action": "write|append", "path": "<full path>", "content": "<file content>"}<<END_FILE_OP>>
+<<FILE_OP>>{{"action": "write|append", "path": "<full path>", "content": "<file content>"}}<<END_FILE_OP>>
 
-Default save location: /Users/bs1026/Documents/assistant-output/
-Google Drive: /Users/bs1026/Library/CloudStorage/GoogleDrive-brenneths@gmail.com/
-OneDrive: /Users/bs1026/Library/CloudStorage/OneDrive-PrincetonUniversity/
+Default save location: {DEFAULT_OUTPUT_DIR}
 
 Keep responses concise for voice conversation. Use natural, conversational language.
 Speak in complete sentences suitable for text-to-speech output.
@@ -78,7 +79,7 @@ Avoid markdown formatting, bullet points, or code blocks in spoken responses \
 unless the user specifically asks for written/formatted content.
 /no_think"""
 
-# Voices ordered by quality grade (A → D), then by type
+# Voices ordered by quality grade (A -> D), then by type
 VOICES = [
     # Grade A / A-
     "af_heart",    # A  — American female (top rated)
@@ -115,15 +116,16 @@ VOICES = [
 # ---------------------------------------------------------------------------
 CHIME_SR = 24000
 
+
 def _generate_chime(freq: float, duration: float, volume: float = 0.15) -> np.ndarray:
     """Generate a soft sine wave chime."""
     t = np.linspace(0, duration, int(CHIME_SR * duration), dtype=np.float32)
-    # Sine wave with fade in/out envelope
     envelope = np.ones_like(t)
     fade = int(CHIME_SR * 0.02)
     envelope[:fade] = np.linspace(0, 1, fade)
     envelope[-fade:] = np.linspace(1, 0, fade)
     return (np.sin(2 * math.pi * freq * t) * envelope * volume).astype(np.float32)
+
 
 CHIME_START = _generate_chime(880, 0.08)   # short high A — "I'm listening"
 CHIME_STOP = _generate_chime(440, 0.08)    # short low A — "got it"
@@ -137,24 +139,30 @@ def play_chime(chime: np.ndarray):
 
 
 # ---------------------------------------------------------------------------
-# Terminal helpers for non-blocking key input
+# Terminal helpers for non-blocking key input (Windows msvcrt)
 # ---------------------------------------------------------------------------
 
-def _set_raw_mode(fd):
-    old = termios.tcgetattr(fd)
-    tty.setraw(fd)
-    return old
-
-
-def _restore_mode(fd, old):
-    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
 def _key_pressed(timeout=0.0):
-    fd = sys.stdin.fileno()
-    rlist, _, _ = select.select([fd], [], [], timeout)
-    if rlist:
-        return sys.stdin.read(1)
+    """Check for a keypress with optional timeout. Returns the key or None."""
+    if timeout <= 0:
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            # Handle special keys (arrows, function keys): they come as two chars
+            if ch in ('\x00', '\xe0'):
+                msvcrt.getwch()  # consume the second byte
+                return None
+            return ch
+        return None
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ('\x00', '\xe0'):
+                msvcrt.getwch()
+                return None
+            return ch
+        time.sleep(0.01)
     return None
 
 
@@ -169,74 +177,60 @@ _tts_end_time = 0.0
 def record_push_to_talk() -> np.ndarray | None:
     print("\n  [Hold SPACE to talk | v:mode  n/p:voice  r:reset  +/-:speed  c:clear  s:save  q:quit]")
 
-    fd = sys.stdin.fileno()
-    old_settings = _set_raw_mode(fd)
     frames = []
 
-    try:
-        while True:
-            ch = _key_pressed(timeout=0.1)
-            if ch == "q":
-                _restore_mode(fd, old_settings)
-                return "QUIT"
-            if ch == "v":
-                _restore_mode(fd, old_settings)
-                return "TOGGLE"
-            if ch == "n":
-                _restore_mode(fd, old_settings)
-                return "NEXT_VOICE"
-            if ch == "p":
-                _restore_mode(fd, old_settings)
-                return "PREV_VOICE"
-            if ch == "r":
-                _restore_mode(fd, old_settings)
-                return "RESET_VOICE"
-            if ch in ("+", "="):
-                _restore_mode(fd, old_settings)
-                return "SPEED_UP"
-            if ch in ("-", "_"):
-                _restore_mode(fd, old_settings)
-                return "SPEED_DOWN"
-            if ch == "c":
-                _restore_mode(fd, old_settings)
-                return "CLEAR"
-            if ch == "s":
-                _restore_mode(fd, old_settings)
-                return "SAVE"
-            if ch == " ":
+    while True:
+        ch = _key_pressed(timeout=0.1)
+        if ch == "q":
+            return "QUIT"
+        if ch == "v":
+            return "TOGGLE"
+        if ch == "n":
+            return "NEXT_VOICE"
+        if ch == "p":
+            return "PREV_VOICE"
+        if ch == "r":
+            return "RESET_VOICE"
+        if ch in ("+", "="):
+            return "SPEED_UP"
+        if ch in ("-", "_"):
+            return "SPEED_DOWN"
+        if ch == "c":
+            return "CLEAR"
+        if ch == "s":
+            return "SAVE"
+        if ch == " ":
+            break
+
+    play_chime(CHIME_START)
+    print("\r  Recording... (release SPACE to stop)", end="", flush=True)
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+        blocksize=1024
+    )
+    stream.start()
+
+    while True:
+        data, _ = stream.read(1024)
+        frames.append(data.copy())
+        ch = _key_pressed(timeout=0.0)
+        if ch is not None and ch != " ":
+            break
+        if ch is None:
+            time.sleep(0.02)
+            data2, _ = stream.read(1024)
+            frames.append(data2.copy())
+            ch2 = _key_pressed(timeout=0.05)
+            if ch2 is None:
+                # Space was released
+                break
+            elif ch2 != " ":
                 break
 
-        play_chime(CHIME_START)
-        print("\r  Recording... (release SPACE to stop)", end="", flush=True)
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
-            blocksize=1024
-        )
-        stream.start()
-
-        while True:
-            data, _ = stream.read(1024)
-            frames.append(data.copy())
-            ch = _key_pressed(timeout=0.0)
-            if ch != " " and ch is not None:
-                break
-            if ch is None:
-                time.sleep(0.02)
-                data2, _ = stream.read(1024)
-                frames.append(data2.copy())
-                ch2 = _key_pressed(timeout=0.05)
-                if ch2 is None:
-                    break
-                elif ch2 != " ":
-                    break
-
-        stream.stop()
-        stream.close()
-        play_chime(CHIME_STOP)
-        print("\r  Processing...                        ", flush=True)
-
-    finally:
-        _restore_mode(fd, old_settings)
+    stream.stop()
+    stream.close()
+    play_chime(CHIME_STOP)
+    print("\r  Processing...                        ", flush=True)
 
     if not frames:
         return None
@@ -248,69 +242,53 @@ def record_push_to_talk() -> np.ndarray | None:
 
 
 def record_vad() -> np.ndarray | None:
-    """Record using VAD with wake word support.
-
-    Waits for speech, transcribes a short clip to check for wake word,
-    then records the full utterance.
-    """
+    """Record using VAD with wake word support."""
     global _tts_end_time
-    print("\n  [Say \"Voice mode\" to activate | v:mode  n/p:voice  r:reset  +/-:speed  c:clear  s:save  q:quit]")
+    print(f'\n  [Say "{WAKE_WORD}" to activate | v:mode  n/p:voice  r:reset  +/-:speed  c:clear  s:save  q:quit]')
 
-    fd = sys.stdin.fileno()
-    old_settings = _set_raw_mode(fd)
     frames = []
     speech_started = False
     silence_start = None
 
-    # Echo cancellation: wait if TTS just finished
     cooldown_remaining = ECHO_COOLDOWN - (time.time() - _tts_end_time)
     if cooldown_remaining > 0:
         time.sleep(cooldown_remaining)
 
-    try:
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
-            blocksize=1024
-        )
-        stream.start()
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+        blocksize=1024
+    )
+    stream.start()
 
+    try:
         while True:
             ch = _key_pressed(timeout=0.0)
             if ch == "q":
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "QUIT"
             if ch == "v":
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "TOGGLE"
             if ch == "n":
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "NEXT_VOICE"
             if ch == "p":
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "PREV_VOICE"
             if ch == "r":
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "RESET_VOICE"
             if ch in ("+", "="):
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "SPEED_UP"
             if ch in ("-", "_"):
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "SPEED_DOWN"
             if ch == "c":
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "CLEAR"
             if ch == "s":
                 stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
                 return "SAVE"
 
             data, _ = stream.read(1024)
@@ -334,9 +312,12 @@ def record_vad() -> np.ndarray | None:
 
         stream.stop()
         stream.close()
-
-    finally:
-        _restore_mode(fd, old_settings)
+    except Exception:
+        try:
+            stream.stop(); stream.close()
+        except Exception:
+            pass
+        return None
 
     if not frames:
         return None
@@ -352,24 +333,18 @@ def record_vad() -> np.ndarray | None:
 
     text_lower = text.lower().strip()
 
-    # Check if utterance starts with wake word
     if not text_lower.startswith(WAKE_WORD):
-        # Not activated — silently ignore
         print("\r                                      ", end="\r", flush=True)
         return None
 
     play_chime(CHIME_WAKE)
 
-    # Strip wake word from the beginning
-    # Handle "computer," "computer:" "computer!" etc.
     after_wake = text[len(WAKE_WORD):].lstrip(" ,.:!?")
 
     if after_wake.strip():
-        # Wake word + command in one utterance (e.g. "Computer, what time is it?")
-        print(f"\r  Processing...                        ", flush=True)
+        print("\r  Processing...                        ", flush=True)
         return after_wake  # Return as string (text, not audio)
     else:
-        # Just the wake word — now record the actual command
         print("\r  Listening...                         ", end="", flush=True)
         play_chime(CHIME_START)
         return _record_after_wake()
@@ -387,7 +362,6 @@ def _record_after_wake() -> np.ndarray | None:
     )
     stream.start()
 
-    # Wait up to 5 seconds for speech to start
     wait_start = time.time()
     while True:
         data, _ = stream.read(1024)
@@ -429,10 +403,10 @@ def _record_after_wake() -> np.ndarray | None:
 
 
 # ---------------------------------------------------------------------------
-# Speech-to-Text
+# Speech-to-Text (faster-whisper for Windows)
 # ---------------------------------------------------------------------------
 
-_whisper_loaded = False
+_whisper_model = None
 
 WHISPER_HALLUCINATIONS = {
     "", "you", "thank you", "thanks", "thank you.", "thanks.", "bye",
@@ -442,26 +416,32 @@ WHISPER_HALLUCINATIONS = {
     "it seems like you didn't send a message",
     "it seems you didn't send a message",
     "it seems like you may be typing",
-    "...", "…",
+    "...", "\u2026",
 }
 
-def transcribe(audio: np.ndarray) -> str:
-    global _whisper_loaded
-    import mlx_whisper
 
-    _whisper_loaded = True
+def transcribe(audio: np.ndarray) -> str:
+    global _whisper_model
 
     rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
     if rms < SILENCE_THRESHOLD * 0.5:
         return ""
 
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",
+        )
+
     audio_f32 = audio.astype(np.float32) / 32768.0
-    result = mlx_whisper.transcribe(
+    segments, _ = _whisper_model.transcribe(
         audio_f32,
-        path_or_hf_repo=WHISPER_MODEL,
         language="en",
+        beam_size=5,
     )
-    text = result.get("text", "").strip()
+    text = " ".join(seg.text.strip() for seg in segments).strip()
 
     if text.lower().strip(".!? ") in WHISPER_HALLUCINATIONS:
         return ""
@@ -476,31 +456,23 @@ def transcribe(audio: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 
 def trim_conversation(messages: list[dict], model: str) -> list[dict]:
-    """Keep conversation within limits by summarizing older exchanges.
-
-    Keeps system prompt + last MAX_HISTORY_PAIRS exchanges.
-    When trimming, asks the LLM to summarize what was cut.
-    """
-    # Count user/assistant pairs (excluding system)
+    """Keep conversation within limits by summarizing older exchanges."""
     non_system = [m for m in messages if m["role"] != "system"]
     pairs = len(non_system) // 2
 
     if pairs <= MAX_HISTORY_PAIRS:
         return messages
 
-    # Split: keep system + summarize old + keep recent
     system_msg = messages[0]
-    keep_count = MAX_HISTORY_PAIRS * 2  # messages to keep (user+assistant pairs)
+    keep_count = MAX_HISTORY_PAIRS * 2
     old_messages = non_system[:-keep_count]
     recent_messages = non_system[-keep_count:]
 
-    # Build summary of old messages
     old_text = ""
     for msg in old_messages:
         role = "User" if msg["role"] == "user" else "Assistant"
         old_text += f"{role}: {msg['content']}\n"
 
-    # Ask LLM to summarize
     summary_prompt = [
         {"role": "system", "content": "Summarize this conversation in 2-3 sentences, capturing key facts, decisions, and any important details the user mentioned. Be concise."},
         {"role": "user", "content": old_text}
@@ -517,12 +489,10 @@ def trim_conversation(messages: list[dict], model: str) -> list[dict]:
         resp.raise_for_status()
         summary = resp.json().get("message", {}).get("content", "")
     except Exception:
-        # If summarization fails, just do a simple trim
         summary = f"[Earlier conversation with {len(old_messages)//2} exchanges was trimmed]"
 
     print(f"  [Conversation trimmed: summarized {len(old_messages)//2} older exchanges]")
 
-    # Rebuild with summary injected
     summary_msg = {
         "role": "system",
         "content": f"Summary of earlier conversation:\n{summary}"
@@ -611,8 +581,6 @@ def chat_streaming(messages: list[dict], model: str, sentence_queue: queue.Queue
 # File Operations
 # ---------------------------------------------------------------------------
 
-ALLOWED_PREFIX = "/Users/bs1026/"
-
 def handle_file_ops(response: str) -> str:
     matches = FILE_OP_PATTERN.findall(response)
     if not matches:
@@ -630,7 +598,9 @@ def handle_file_ops(response: str) -> str:
         content = op.get("content", "")
         path = Path(path_str)
 
-        if not str(path).startswith(ALLOWED_PREFIX):
+        # Safety: normalize to forward slashes for comparison
+        normalized = str(path).replace("\\", "/")
+        if not normalized.startswith(ALLOWED_PREFIX):
             print(f"  [Blocked: path {path} is outside allowed prefix]")
             continue
 
@@ -658,10 +628,13 @@ def handle_file_ops(response: str) -> str:
 # Text-to-Speech (Kokoro ONNX) — with voice interrupt + echo cancellation
 # ---------------------------------------------------------------------------
 
-KOKORO_MODEL_PATH = Path.home() / "ai-env" / "models" / "kokoro-v1.0.onnx"
-KOKORO_VOICES_PATH = Path.home() / "ai-env" / "models" / "voices-v1.0.bin"
+# PC version: look for models in script directory or user home
+_script_dir = Path(__file__).parent
+KOKORO_MODEL_PATH = _script_dir / "models" / "kokoro-v1.0.onnx"
+KOKORO_VOICES_PATH = _script_dir / "models" / "voices-v1.0.bin"
 
 _tts_model = None
+
 
 def _clean_for_tts(text: str) -> str:
     """Strip markdown and other formatting that sounds bad when spoken."""
@@ -683,7 +656,6 @@ def _play_with_interrupt(samples, sample_rate, vad_mode: bool) -> bool:
     sd.play(samples, samplerate=sample_rate)
 
     if vad_mode:
-        # Monitor mic for voice interrupt
         try:
             mic_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
@@ -706,19 +678,13 @@ def _play_with_interrupt(samples, sample_rate, vad_mode: bool) -> bool:
             sd.wait()
     else:
         # Monitor keyboard for ESC
-        fd = sys.stdin.fileno()
-        old_settings = _set_raw_mode(fd)
-        try:
-            while sd.get_stream().active:
-                ch = _key_pressed(timeout=0.1)
-                if ch == "\x1b":
-                    sd.stop()
-                    print("  [Skipped]")
-                    _restore_mode(fd, old_settings)
-                    _tts_end_time = time.time()
-                    return True
-        finally:
-            _restore_mode(fd, old_settings)
+        while sd.get_stream().active:
+            ch = _key_pressed(timeout=0.1)
+            if ch == "\x1b":
+                sd.stop()
+                print("  [Skipped]")
+                _tts_end_time = time.time()
+                return True
 
     _tts_end_time = time.time()
     return False
@@ -772,7 +738,7 @@ def save_conversation(messages: list[dict]):
     ts = time.strftime("%Y%m%d_%H%M%S")
     path = DEFAULT_OUTPUT_DIR / f"conversation_{ts}.md"
 
-    lines = [f"# Voice Assistant Conversation — {time.strftime('%Y-%m-%d %H:%M')}\n\n"]
+    lines = [f"# Voice Assistant Conversation \u2014 {time.strftime('%Y-%m-%d %H:%M')}\n\n"]
     for msg in messages:
         if msg["role"] == "system":
             continue
@@ -784,12 +750,106 @@ def save_conversation(messages: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# VAD without wake word
+# ---------------------------------------------------------------------------
+
+def _record_vad_no_wake() -> np.ndarray | None:
+    """VAD recording without wake word."""
+    global _tts_end_time
+    print("\n  [Listening... speak to begin | v:mode  n/p:voice  r:reset  +/-:speed  c:clear  s:save  q:quit]")
+
+    frames = []
+    speech_started = False
+    silence_start = None
+
+    cooldown_remaining = ECHO_COOLDOWN - (time.time() - _tts_end_time)
+    if cooldown_remaining > 0:
+        time.sleep(cooldown_remaining)
+
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+        blocksize=1024
+    )
+    stream.start()
+
+    try:
+        while True:
+            ch = _key_pressed(timeout=0.0)
+            if ch == "q":
+                stream.stop(); stream.close()
+                return "QUIT"
+            if ch == "v":
+                stream.stop(); stream.close()
+                return "TOGGLE"
+            if ch == "n":
+                stream.stop(); stream.close()
+                return "NEXT_VOICE"
+            if ch == "p":
+                stream.stop(); stream.close()
+                return "PREV_VOICE"
+            if ch == "r":
+                stream.stop(); stream.close()
+                return "RESET_VOICE"
+            if ch in ("+", "="):
+                stream.stop(); stream.close()
+                return "SPEED_UP"
+            if ch in ("-", "_"):
+                stream.stop(); stream.close()
+                return "SPEED_DOWN"
+            if ch == "c":
+                stream.stop(); stream.close()
+                return "CLEAR"
+            if ch == "s":
+                stream.stop(); stream.close()
+                return "SAVE"
+
+            data, _ = stream.read(1024)
+            rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
+
+            if not speech_started:
+                if rms > SILENCE_THRESHOLD:
+                    speech_started = True
+                    silence_start = None
+                    frames.append(data.copy())
+                    play_chime(CHIME_START)
+                    print("\r  Recording...                        ", end="", flush=True)
+            else:
+                frames.append(data.copy())
+                if rms < SILENCE_THRESHOLD:
+                    if silence_start is None:
+                        silence_start = time.time()
+                    elif time.time() - silence_start > SILENCE_TIMEOUT:
+                        break
+                else:
+                    silence_start = None
+
+        stream.stop()
+        stream.close()
+        play_chime(CHIME_STOP)
+        print("\r  Processing...                        ", flush=True)
+
+    except Exception:
+        try:
+            stream.stop(); stream.close()
+        except Exception:
+            pass
+
+    if not frames:
+        return None
+
+    audio = np.concatenate(frames, axis=0).flatten()
+    if len(audio) / SAMPLE_RATE < MIN_SPEECH_DURATION:
+        return None
+    return audio
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Local Voice Assistant")
-    parser.add_argument("--model", default="qwen3:14b", help="Ollama model name")
+    parser = argparse.ArgumentParser(description="Local Voice Assistant (PC)")
+    parser.add_argument("--model", default="qwen3:8b", help="Ollama model name")
     parser.add_argument("--voice", default="af_heart", help="Kokoro TTS voice")
     parser.add_argument("--speed", type=float, default=1.0, help="TTS speed (0.5-2.0)")
     parser.add_argument("--vad", action="store_true", help="Start in always-listening mode")
@@ -802,7 +862,7 @@ def main():
     use_wake_word = not args.no_wake
 
     print("=" * 60)
-    print("  Local Voice Assistant")
+    print("  Local Voice Assistant (PC)")
     print(f"  Model: {args.model}  |  Voice: {voice}  |  Speed: {speed:.1f}x")
     if args.vad:
         wake_status = f'Wake word: "{WAKE_WORD}"' if use_wake_word else "Wake word: disabled"
@@ -816,15 +876,20 @@ def main():
 
     # Preload models at startup
     print("\n  Loading models...")
-    global _tts_model, _whisper_loaded
-    import mlx_whisper
-    print("    Whisper STT...", end=" ", flush=True)
-    mlx_whisper.transcribe(
+    global _tts_model, _whisper_model
+
+    print("    Whisper STT (faster-whisper)...", end=" ", flush=True)
+    from faster_whisper import WhisperModel
+    _whisper_model = WhisperModel(
+        WHISPER_MODEL,
+        device="cpu",
+        compute_type="int8",
+    )
+    # Warm up with silent audio
+    _whisper_model.transcribe(
         np.zeros(SAMPLE_RATE, dtype=np.float32),
-        path_or_hf_repo=WHISPER_MODEL,
         language="en",
     )
-    _whisper_loaded = True
     print("done")
 
     print("    Kokoro TTS...", end=" ", flush=True)
@@ -849,7 +914,6 @@ def main():
             if result is None:
                 continue
             if isinstance(result, str):
-                # Check for control commands first
                 if result == "QUIT":
                     print("\n  Goodbye!")
                     break
@@ -889,12 +953,10 @@ def main():
                     save_conversation(messages)
                     continue
 
-                # If it's a string but not a command, it's pre-transcribed text
-                # (from wake word + command in one utterance)
+                # Pre-transcribed text from wake word
                 text = result
 
             else:
-                # It's audio — transcribe it
                 text = transcribe(result)
 
             if not text:
@@ -903,13 +965,11 @@ def main():
 
             print(f"\n  You: {text}")
 
-            # Trim conversation if needed
             messages = trim_conversation(messages, args.model)
 
             messages.append({"role": "user", "content": text})
             print("\n  Assistant: ", end="", flush=True)
 
-            # Stream LLM response and TTS in parallel
             sq = queue.Queue()
             tts_thread = threading.Thread(
                 target=speak_streaming,
@@ -931,104 +991,6 @@ def main():
         except Exception as e:
             print(f"\n  [Error: {e}]")
             continue
-
-
-def _record_vad_no_wake() -> np.ndarray | None:
-    """VAD recording without wake word (same as old record_vad)."""
-    global _tts_end_time
-    print("\n  [Listening... speak to begin | v:mode  n/p:voice  r:reset  +/-:speed  c:clear  s:save  q:quit]")
-
-    fd = sys.stdin.fileno()
-    old_settings = _set_raw_mode(fd)
-    frames = []
-    speech_started = False
-    silence_start = None
-
-    cooldown_remaining = ECHO_COOLDOWN - (time.time() - _tts_end_time)
-    if cooldown_remaining > 0:
-        time.sleep(cooldown_remaining)
-
-    try:
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
-            blocksize=1024
-        )
-        stream.start()
-
-        while True:
-            ch = _key_pressed(timeout=0.0)
-            if ch == "q":
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "QUIT"
-            if ch == "v":
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "TOGGLE"
-            if ch == "n":
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "NEXT_VOICE"
-            if ch == "p":
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "PREV_VOICE"
-            if ch == "r":
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "RESET_VOICE"
-            if ch in ("+", "="):
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "SPEED_UP"
-            if ch in ("-", "_"):
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "SPEED_DOWN"
-            if ch == "c":
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "CLEAR"
-            if ch == "s":
-                stream.stop(); stream.close()
-                _restore_mode(fd, old_settings)
-                return "SAVE"
-
-            data, _ = stream.read(1024)
-            rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
-
-            if not speech_started:
-                if rms > SILENCE_THRESHOLD:
-                    speech_started = True
-                    silence_start = None
-                    frames.append(data.copy())
-                    play_chime(CHIME_START)
-                    print("\r  Recording...                        ", end="", flush=True)
-            else:
-                frames.append(data.copy())
-                if rms < SILENCE_THRESHOLD:
-                    if silence_start is None:
-                        silence_start = time.time()
-                    elif time.time() - silence_start > SILENCE_TIMEOUT:
-                        break
-                else:
-                    silence_start = None
-
-        stream.stop()
-        stream.close()
-        play_chime(CHIME_STOP)
-        print("\r  Processing...                        ", flush=True)
-
-    finally:
-        _restore_mode(fd, old_settings)
-
-    if not frames:
-        return None
-
-    audio = np.concatenate(frames, axis=0).flatten()
-    if len(audio) / SAMPLE_RATE < MIN_SPEECH_DURATION:
-        return None
-    return audio
 
 
 if __name__ == "__main__":

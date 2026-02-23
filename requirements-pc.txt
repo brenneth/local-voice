@@ -1,0 +1,6 @@
+# PC (Windows) dependencies for Local Voice Assistant
+faster-whisper
+sounddevice
+kokoro-onnx
+httpx
+numpy
