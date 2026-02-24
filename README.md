@@ -15,6 +15,7 @@ Two versions:
 - macOS with Apple Silicon (M1/M2/M3/M4)
 - Python 3.12+
 - [Ollama](https://ollama.com) with `qwen3:14b` or `qwen3:32b`
+- English-only: STT uses `whisper-large-v3-turbo` (greedy decode, no language detection overhead)
 - [Homebrew](https://brew.sh)
 
 ### Install
@@ -57,6 +58,7 @@ curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-fil
 - Windows 10/11
 - Python 3.10+
 - [Ollama for Windows](https://ollama.com) with `qwen3:8b`
+- English-only: STT uses `distil-medium.en` (English-only distilled Whisper, faster than large-v3-turbo)
 - ~16GB RAM recommended
 
 ### Install

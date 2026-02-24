@@ -45,7 +45,7 @@ MAX_HISTORY_PAIRS = 20  # max user/assistant exchanges before summarizing
 WAKE_WORD = "voice mode"
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-WHISPER_MODEL = "large-v3-turbo"
+WHISPER_MODEL = "distil-medium.en"
 
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "assistant-output"
 
@@ -439,7 +439,8 @@ def transcribe(audio: np.ndarray) -> str:
     segments, _ = _whisper_model.transcribe(
         audio_f32,
         language="en",
-        beam_size=5,
+        beam_size=1,
+        condition_on_previous_text=False,
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -889,6 +890,8 @@ def main():
     _whisper_model.transcribe(
         np.zeros(SAMPLE_RATE, dtype=np.float32),
         language="en",
+        beam_size=1,
+        condition_on_previous_text=False,
     )
     print("done")
 
