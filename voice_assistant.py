@@ -608,7 +608,7 @@ def chat_streaming(messages: list[dict], model: str, sentence_queue: queue.Queue
         "keep_alive": "30m",
         "options": {
             "num_ctx": 2048,
-            "num_predict": 300,
+            "num_predict": 150,
         },
     }
 
@@ -912,7 +912,7 @@ def save_conversation(messages: list[dict]):
 
 def main():
     parser = argparse.ArgumentParser(description="Local Voice Assistant")
-    parser.add_argument("--model", default="qwen3:14b", help="Ollama model name")
+    parser.add_argument("--model", default="qwen2.5:14b", help="Ollama model name")
     parser.add_argument("--voice", default="af_heart", help="Kokoro TTS voice")
     parser.add_argument("--speed", type=float, default=1.0, help="TTS speed (0.5-2.0)")
     parser.add_argument("--vad", action="store_true", help="Start in always-listening mode")
