@@ -36,7 +36,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
 SILENCE_THRESHOLD = 500  # RMS threshold for VAD
-SILENCE_TIMEOUT = 1.5  # seconds of silence before stopping
+SILENCE_TIMEOUT = 1.2  # seconds of silence before stopping
 MIN_SPEECH_DURATION = 0.3  # minimum seconds to consider as speech
 INTERRUPT_RMS = 800  # mic RMS to trigger voice interrupt
 ECHO_COOLDOWN = 0.5  # seconds to mute mic after TTS finishes
@@ -512,6 +512,12 @@ def chat_streaming(messages: list[dict], model: str, sentence_queue: queue.Queue
         "model": model,
         "messages": messages,
         "stream": True,
+        "think": False,
+        "keep_alive": "30m",
+        "options": {
+            "num_ctx": 4096,
+            "num_predict": 300,
+        },
     }
 
     full_response = []
