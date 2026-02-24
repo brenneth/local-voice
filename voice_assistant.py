@@ -69,7 +69,7 @@ def _is_speech(data: np.ndarray) -> bool:
 WAKE_WORD = "voice mode"
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-WHISPER_MODEL = "mlx-community/distil-whisper-large-v3"
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "assistant-output"
 
@@ -519,6 +519,8 @@ def transcribe(audio: np.ndarray) -> str:
         audio_f32,
         path_or_hf_repo=WHISPER_MODEL,
         language="en",
+        beam_size=1,
+        condition_on_previous_text=False,
     )
     text = result.get("text", "").strip()
 
@@ -607,8 +609,8 @@ def chat_streaming(messages: list[dict], model: str, sentence_queue: queue.Queue
         "think": False,
         "keep_alive": "30m",
         "options": {
-            "num_ctx": 2048,
-            "num_predict": 150,
+            "num_ctx": 4096,
+            "num_predict": 300,
         },
     }
 
@@ -912,7 +914,7 @@ def save_conversation(messages: list[dict]):
 
 def main():
     parser = argparse.ArgumentParser(description="Local Voice Assistant")
-    parser.add_argument("--model", default="qwen2.5:14b", help="Ollama model name")
+    parser.add_argument("--model", default="qwen3:14b", help="Ollama model name")
     parser.add_argument("--voice", default="af_heart", help="Kokoro TTS voice")
     parser.add_argument("--speed", type=float, default=1.0, help="TTS speed (0.5-2.0)")
     parser.add_argument("--vad", action="store_true", help="Start in always-listening mode")
@@ -951,6 +953,8 @@ def main():
         np.zeros(SAMPLE_RATE, dtype=np.float32),
         path_or_hf_repo=WHISPER_MODEL,
         language="en",
+        beam_size=1,
+        condition_on_previous_text=False,
     )
     _whisper_loaded = True
     print("done")
