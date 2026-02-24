@@ -6,3 +6,5 @@ models/
 *.bin
 .env
 .DS_Store
+venv/
+iphone_replies/
