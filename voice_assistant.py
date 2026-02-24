@@ -38,7 +38,7 @@ CHANNELS = 1
 DTYPE = "int16"
 SILENCE_TIMEOUT = 1.2  # seconds of silence before stopping
 MIN_SPEECH_DURATION = 0.5  # minimum seconds to consider as speech
-INTERRUPT_RMS = 1200  # mic RMS to trigger voice interrupt
+INTERRUPT_RMS = 3000  # mic RMS to trigger voice interrupt (increased to reduce false triggers)
 ECHO_COOLDOWN = 0.8  # seconds to mute mic after TTS finishes (echo cancellation)
 
 # WebRTC VAD — neural speech detector (mode 3 = most aggressive filtering)
@@ -391,8 +391,8 @@ def record_vad() -> np.ndarray | None:
 
     # Check if utterance starts with wake word
     if not text_lower.startswith(WAKE_WORD):
-        # Not activated — silently ignore
-        print("\r                                      ", end="\r", flush=True)
+        # Not activated — show what was heard for debugging
+        print(f"\r  Heard: \"{text}\" (waiting for \"{WAKE_WORD}\")     ", flush=True)
         return None
 
     play_chime(CHIME_WAKE)
@@ -519,7 +519,6 @@ def transcribe(audio: np.ndarray) -> str:
         audio_f32,
         path_or_hf_repo=WHISPER_MODEL,
         language="en",
-        beam_size=1,
         condition_on_previous_text=False,
     )
     text = result.get("text", "").strip()
@@ -780,7 +779,7 @@ def speak_streaming(sentence_queue: queue.Queue, voice: str, speed: float, vad_m
     def _monitor_mic(stop_event):
         """Background thread: monitor mic for sustained speech to interrupt."""
         nonlocal interrupted
-        INTERRUPT_FRAMES_REQUIRED = 5
+        INTERRUPT_FRAMES_REQUIRED = 10  # require more frames to reduce false interrupts
         loud_count = 0
         try:
             mic = sd.InputStream(
@@ -953,7 +952,6 @@ def main():
         np.zeros(SAMPLE_RATE, dtype=np.float32),
         path_or_hf_repo=WHISPER_MODEL,
         language="en",
-        beam_size=1,
         condition_on_previous_text=False,
     )
     _whisper_loaded = True
@@ -983,6 +981,10 @@ def main():
     print(f"\n  Mode: {'Always-listening (VAD)' if vad_mode else 'Push-to-talk'}")
     print("  Ready.")
     play_chime(CHIME_WAKE)
+
+    # Start in "awake" mode - only require wake word after idle timeout
+    if vad_mode and use_wake_word:
+        _last_interaction_time = time.time()
 
     while True:
         try:
