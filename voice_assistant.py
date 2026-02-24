@@ -28,6 +28,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 import sounddevice as sd
+import webrtcvad
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,13 +36,35 @@ import sounddevice as sd
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
-SILENCE_THRESHOLD = 500  # RMS threshold for VAD
 SILENCE_TIMEOUT = 1.2  # seconds of silence before stopping
-MIN_SPEECH_DURATION = 0.3  # minimum seconds to consider as speech
-INTERRUPT_RMS = 1200  # mic RMS to trigger voice interrupt (raised to avoid MacBook echo)
+MIN_SPEECH_DURATION = 0.5  # minimum seconds to consider as speech
+INTERRUPT_RMS = 1200  # mic RMS to trigger voice interrupt
 ECHO_COOLDOWN = 0.8  # seconds to mute mic after TTS finishes (echo cancellation)
+
+# WebRTC VAD — neural speech detector (mode 3 = most aggressive filtering)
+_vad = webrtcvad.Vad(3)
+VAD_FRAME_MS = 30  # webrtcvad requires 10, 20, or 30ms frames
+VAD_FRAME_SIZE = SAMPLE_RATE * VAD_FRAME_MS // 1000  # 480 samples at 16kHz
 IDLE_TIMEOUT = 30 * 60  # seconds before requiring wake word again
 MAX_HISTORY_PAIRS = 20  # max user/assistant exchanges before summarizing
+
+
+def _is_speech(data: np.ndarray) -> bool:
+    """Use WebRTC VAD to check if an audio chunk contains human speech.
+
+    Unlike RMS thresholds, this detects speech specifically — keystrokes,
+    clicks, fans, and other non-speech sounds are rejected.
+    """
+    raw = data.tobytes()
+    # Check multiple 30ms frames within the chunk, return True if any has speech
+    for offset in range(0, len(raw) - VAD_FRAME_SIZE * 2 + 1, VAD_FRAME_SIZE * 2):
+        frame = raw[offset:offset + VAD_FRAME_SIZE * 2]  # *2 because int16 = 2 bytes
+        try:
+            if _vad.is_speech(frame, SAMPLE_RATE):
+                return True
+        except Exception:
+            pass
+    return False
 
 WAKE_WORD = "voice mode"
 
@@ -263,7 +286,10 @@ def record_vad() -> np.ndarray | None:
     old_settings = _set_raw_mode(fd)
     frames = []
     speech_started = False
+    speech_confirm_count = 0  # require consecutive speech frames
     silence_start = None
+
+    SPEECH_CONFIRM_FRAMES = 3  # ~192ms of consecutive speech before triggering
 
     # Echo cancellation: wait if TTS just finished
     cooldown_remaining = ECHO_COOLDOWN - (time.time() - _tts_end_time)
@@ -276,6 +302,7 @@ def record_vad() -> np.ndarray | None:
             blocksize=1024
         )
         stream.start()
+        pending_frames = []  # buffer frames during confirmation
 
         while True:
             ch = _key_pressed(timeout=0.0)
@@ -317,17 +344,24 @@ def record_vad() -> np.ndarray | None:
                 return "SAVE"
 
             data, _ = stream.read(1024)
-            rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
+            speech = _is_speech(data)
 
             if not speech_started:
-                if rms > SILENCE_THRESHOLD:
-                    speech_started = True
-                    silence_start = None
-                    frames.append(data.copy())
-                    print("\r  Hearing speech...                   ", end="", flush=True)
+                if speech:
+                    speech_confirm_count += 1
+                    pending_frames.append(data.copy())
+                    if speech_confirm_count >= SPEECH_CONFIRM_FRAMES:
+                        speech_started = True
+                        silence_start = None
+                        frames.extend(pending_frames)
+                        pending_frames = []
+                        print("\r  Hearing speech...                   ", end="", flush=True)
+                else:
+                    speech_confirm_count = 0
+                    pending_frames.clear()
             else:
                 frames.append(data.copy())
-                if rms < SILENCE_THRESHOLD:
+                if not speech:
                     if silence_start is None:
                         silence_start = time.time()
                     elif time.time() - silence_start > SILENCE_TIMEOUT:
@@ -394,10 +428,10 @@ def _record_after_wake() -> np.ndarray | None:
     wait_start = time.time()
     while True:
         data, _ = stream.read(1024)
-        rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
+        speech = _is_speech(data)
 
         if not speech_started:
-            if rms > SILENCE_THRESHOLD:
+            if speech:
                 speech_started = True
                 silence_start = None
                 frames.append(data.copy())
@@ -409,7 +443,7 @@ def _record_after_wake() -> np.ndarray | None:
                 return None
         else:
             frames.append(data.copy())
-            if rms < SILENCE_THRESHOLD:
+            if not speech:
                 if silence_start is None:
                     silence_start = time.time()
                 elif time.time() - silence_start > SILENCE_TIMEOUT:
@@ -448,14 +482,36 @@ WHISPER_HALLUCINATIONS = {
     "...", "…",
 }
 
+def _is_real_speech(text: str) -> bool:
+    """Check if transcribed text looks like actual English speech, not noise artifacts."""
+    # Must be mostly ASCII (rejects Japanese/Chinese hallucinations)
+    if not text.isascii():
+        return False
+    # Must contain at least one actual English letter
+    if not any(c.isalpha() for c in text):
+        return False
+    # Must have at least one word with 2+ letters (rejects "a a a", "eh eh eh")
+    words = text.split()
+    real_words = [w for w in words if len(w.strip(".,!?;:'\"")) >= 2]
+    if not real_words:
+        return False
+    # Reject highly repetitive output (noise artifacts like "eh eh eh eh")
+    if len(words) >= 3:
+        unique = set(w.lower().strip(".,!?") for w in words)
+        if len(unique) == 1:
+            return False
+    return True
+
+
 def transcribe(audio: np.ndarray) -> str:
     global _whisper_loaded
     import mlx_whisper
 
     _whisper_loaded = True
 
+    # Quick energy check — skip near-silent audio
     rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
-    if rms < SILENCE_THRESHOLD * 0.5:
+    if rms < 300:
         return ""
 
     audio_f32 = audio.astype(np.float32) / 32768.0
@@ -469,6 +525,8 @@ def transcribe(audio: np.ndarray) -> str:
     if text.lower().strip(".!? ") in WHISPER_HALLUCINATIONS:
         return ""
     if len(text) < 3:
+        return ""
+    if not _is_real_speech(text):
         return ""
 
     return text
@@ -1034,7 +1092,10 @@ def _record_vad_no_wake() -> np.ndarray | None:
     old_settings = _set_raw_mode(fd)
     frames = []
     speech_started = False
+    speech_confirm_count = 0
     silence_start = None
+
+    SPEECH_CONFIRM_FRAMES = 3
 
     cooldown_remaining = ECHO_COOLDOWN - (time.time() - _tts_end_time)
     if cooldown_remaining > 0:
@@ -1087,18 +1148,22 @@ def _record_vad_no_wake() -> np.ndarray | None:
                 return "SAVE"
 
             data, _ = stream.read(1024)
-            rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
+            speech = _is_speech(data)
 
             if not speech_started:
-                if rms > SILENCE_THRESHOLD:
-                    speech_started = True
-                    silence_start = None
-                    frames.append(data.copy())
-                    play_chime(CHIME_START)
-                    print("\r  Recording...                        ", end="", flush=True)
+                if speech:
+                    speech_confirm_count += 1
+                    if speech_confirm_count >= SPEECH_CONFIRM_FRAMES:
+                        speech_started = True
+                        silence_start = None
+                        frames.append(data.copy())
+                        play_chime(CHIME_START)
+                        print("\r  Recording...                        ", end="", flush=True)
+                else:
+                    speech_confirm_count = 0
             else:
                 frames.append(data.copy())
-                if rms < SILENCE_THRESHOLD:
+                if not speech:
                     if silence_start is None:
                         silence_start = time.time()
                     elif time.time() - silence_start > SILENCE_TIMEOUT:
