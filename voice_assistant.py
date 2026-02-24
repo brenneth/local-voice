@@ -36,16 +36,17 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
 SILENCE_THRESHOLD = 500  # RMS threshold for VAD
-SILENCE_TIMEOUT = 1.5  # seconds of silence before stopping
+SILENCE_TIMEOUT = 1.2  # seconds of silence before stopping
 MIN_SPEECH_DURATION = 0.3  # minimum seconds to consider as speech
-INTERRUPT_RMS = 800  # mic RMS to trigger voice interrupt (higher than VAD to avoid echo)
-ECHO_COOLDOWN = 0.5  # seconds to mute mic after TTS finishes (echo cancellation)
+INTERRUPT_RMS = 1200  # mic RMS to trigger voice interrupt (raised to avoid MacBook echo)
+ECHO_COOLDOWN = 0.8  # seconds to mute mic after TTS finishes (echo cancellation)
+IDLE_TIMEOUT = 30 * 60  # seconds before requiring wake word again
 MAX_HISTORY_PAIRS = 20  # max user/assistant exchanges before summarizing
 
 WAKE_WORD = "voice mode"
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+WHISPER_MODEL = "mlx-community/distil-whisper-large-v3"
 
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "assistant-output"
 
@@ -75,8 +76,7 @@ OneDrive: /Users/bs1026/Library/CloudStorage/OneDrive-PrincetonUniversity/
 Keep responses concise for voice conversation. Use natural, conversational language.
 Speak in complete sentences suitable for text-to-speech output.
 Avoid markdown formatting, bullet points, or code blocks in spoken responses \
-unless the user specifically asks for written/formatted content.
-/no_think"""
+unless the user specifically asks for written/formatted content."""
 
 # Voices ordered by quality grade (A → D), then by type
 VOICES = [
@@ -164,6 +164,9 @@ def _key_pressed(timeout=0.0):
 
 # Timestamp of when TTS last finished playing (for echo cancellation)
 _tts_end_time = 0.0
+
+# Timestamp of last successful interaction (for conversational flow)
+_last_interaction_time = 0.0
 
 
 def record_push_to_talk() -> np.ndarray | None:
@@ -510,6 +513,8 @@ def trim_conversation(messages: list[dict], model: str) -> list[dict]:
         "model": model,
         "messages": summary_prompt,
         "stream": False,
+        "think": False,
+        "keep_alive": "30m",
     }
 
     try:
@@ -541,10 +546,17 @@ def chat_streaming(messages: list[dict], model: str, sentence_queue: queue.Queue
         "model": model,
         "messages": messages,
         "stream": True,
+        "think": False,
+        "keep_alive": "30m",
+        "options": {
+            "num_ctx": 2048,
+            "num_predict": 300,
+        },
     }
 
     full_response = []
     sentence_buffer = ""
+    buffer_start_time = None
     in_think_block = False
     in_file_op = False
 
@@ -576,14 +588,27 @@ def chat_streaming(messages: list[dict], model: str, sentence_queue: queue.Queue
 
                     if not in_think_block and not in_file_op:
                         sentence_buffer += token
+                        if buffer_start_time is None:
+                            buffer_start_time = time.time()
 
+                        # Split on sentence breaks (.!?)
                         parts = SENTENCE_END.split(sentence_buffer)
                         if len(parts) > 1:
-                            for sentence in parts[:-1]:
-                                sentence = sentence.strip()
-                                if sentence:
-                                    sentence_queue.put(sentence)
+                            for s in parts[:-1]:
+                                s = s.strip()
+                                if s:
+                                    sentence_queue.put(s)
                             sentence_buffer = parts[-1]
+                            buffer_start_time = time.time() if sentence_buffer.strip() else None
+                            continue
+
+                        # Time-based flush: if buffer has been sitting for 2s, send it
+                        if buffer_start_time and (time.time() - buffer_start_time > 2.0):
+                            partial = sentence_buffer.strip()
+                            if partial:
+                                sentence_queue.put(partial)
+                                sentence_buffer = ""
+                                buffer_start_time = None
 
                 if chunk.get("done"):
                     break
@@ -677,60 +702,64 @@ def _clean_for_tts(text: str) -> str:
     return text.strip()
 
 
-def _play_with_interrupt(samples, sample_rate, vad_mode: bool) -> bool:
-    """Play audio, monitoring for interrupt. Returns True if interrupted."""
-    global _tts_end_time
-    sd.play(samples, samplerate=sample_rate)
-
-    if vad_mode:
-        # Monitor mic for voice interrupt
-        try:
-            mic_stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
-                blocksize=1024
-            )
-            mic_stream.start()
-            while sd.get_stream().active:
-                mic_data, _ = mic_stream.read(1024)
-                mic_rms = np.sqrt(np.mean(mic_data.astype(np.float32) ** 2))
-                if mic_rms > INTERRUPT_RMS:
-                    sd.stop()
-                    mic_stream.stop()
-                    mic_stream.close()
-                    _tts_end_time = time.time()
-                    print("  [Interrupted]")
-                    return True
-            mic_stream.stop()
-            mic_stream.close()
-        except Exception:
-            sd.wait()
-    else:
-        # Monitor keyboard for ESC
-        fd = sys.stdin.fileno()
-        old_settings = _set_raw_mode(fd)
-        try:
-            while sd.get_stream().active:
-                ch = _key_pressed(timeout=0.1)
-                if ch == "\x1b":
-                    sd.stop()
-                    print("  [Skipped]")
-                    _restore_mode(fd, old_settings)
-                    _tts_end_time = time.time()
-                    return True
-        finally:
-            _restore_mode(fd, old_settings)
-
-    _tts_end_time = time.time()
-    return False
-
-
 def speak_streaming(sentence_queue: queue.Queue, voice: str, speed: float, vad_mode: bool):
-    """Consume sentences from queue, synthesize and play with interrupt support."""
-    global _tts_model
+    """Consume sentences from queue, synthesize and play using blocking OutputStream.write().
+
+    Uses a single continuous OutputStream with blocking write() calls for
+    gapless audio. A background thread monitors the mic for voice interrupts.
+    """
+    global _tts_model, _tts_end_time
 
     if _tts_model is None:
         from kokoro_onnx import Kokoro
         _tts_model = Kokoro(str(KOKORO_MODEL_PATH), str(KOKORO_VOICES_PATH))
+
+    interrupted = False
+    out_stream = None
+
+    def _monitor_mic(stop_event):
+        """Background thread: monitor mic for sustained speech to interrupt."""
+        nonlocal interrupted
+        INTERRUPT_FRAMES_REQUIRED = 5
+        loud_count = 0
+        try:
+            mic = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+                blocksize=1024,
+            )
+            mic.start()
+            while not stop_event.is_set() and not interrupted:
+                mic_data, _ = mic.read(1024)
+                mic_rms = np.sqrt(np.mean(mic_data.astype(np.float32) ** 2))
+                if mic_rms > INTERRUPT_RMS:
+                    loud_count += 1
+                    if loud_count >= INTERRUPT_FRAMES_REQUIRED:
+                        interrupted = True
+                        print("  [Interrupted]")
+                        break
+                else:
+                    loud_count = 0
+            mic.stop()
+            mic.close()
+        except Exception:
+            pass
+
+    def _monitor_keyboard(stop_event):
+        """Background thread: monitor ESC key for interrupt in push-to-talk mode."""
+        nonlocal interrupted
+        fd = sys.stdin.fileno()
+        old_settings = _set_raw_mode(fd)
+        try:
+            while not stop_event.is_set() and not interrupted:
+                ch = _key_pressed(timeout=0.1)
+                if ch == "\x1b":
+                    interrupted = True
+                    print("  [Skipped]")
+                    break
+        finally:
+            _restore_mode(fd, old_settings)
+
+    monitor_stop = threading.Event()
 
     while True:
         try:
@@ -741,26 +770,62 @@ def speak_streaming(sentence_queue: queue.Queue, voice: str, speed: float, vad_m
         if sentence is None:
             break
 
+        if interrupted:
+            # Drain remaining sentences
+            while True:
+                try:
+                    if sentence_queue.get_nowait() is None:
+                        break
+                except queue.Empty:
+                    break
+            break
+
         sentence = _clean_for_tts(sentence)
         if not sentence or sentence.startswith("[Error"):
             continue
 
         try:
             samples, sample_rate = _tts_model.create(
-                sentence, voice=voice, speed=speed, lang="en-us"
+                sentence, voice=voice, speed=speed, lang="en-us",
             )
-            interrupted = _play_with_interrupt(samples, sample_rate, vad_mode)
-            if interrupted:
-                while True:
-                    try:
-                        remaining = sentence_queue.get_nowait()
-                        if remaining is None:
-                            break
-                    except queue.Empty:
-                        break
-                return
+
+            # Ensure samples are float32 column vector for write()
+            audio = samples.astype(np.float32)
+            if audio.ndim == 1:
+                audio = audio.reshape(-1, 1)
+
+            # Open stream on first chunk
+            if out_stream is None:
+                out_stream = sd.OutputStream(
+                    samplerate=sample_rate,
+                    channels=1,
+                    dtype="float32",
+                )
+                out_stream.start()
+                monitor_target = _monitor_mic if vad_mode else _monitor_keyboard
+                threading.Thread(
+                    target=monitor_target,
+                    args=(monitor_stop,),
+                    daemon=True,
+                ).start()
+
+            # Write in chunks so we can check for interrupts
+            chunk_size = 4096
+            for i in range(0, len(audio), chunk_size):
+                if interrupted:
+                    break
+                out_stream.write(audio[i:i + chunk_size])
+
         except Exception as e:
             print(f"  [TTS error: {e}]")
+
+    # Clean up
+    monitor_stop.set()
+    if out_stream is not None:
+        out_stream.stop()
+        out_stream.close()
+
+    _tts_end_time = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +859,12 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="TTS speed (0.5-2.0)")
     parser.add_argument("--vad", action="store_true", help="Start in always-listening mode")
     parser.add_argument("--no-wake", action="store_true", help="Disable wake word in VAD mode")
+    parser.add_argument("--whisper-model", default=None, help="Override Whisper model repo")
     args = parser.parse_args()
+
+    global WHISPER_MODEL
+    if args.whisper_model:
+        WHISPER_MODEL = args.whisper_model
 
     voice = args.voice
     voice_idx = VOICES.index(voice) if voice in VOICES else 0
@@ -816,7 +886,7 @@ def main():
 
     # Preload models at startup
     print("\n  Loading models...")
-    global _tts_model, _whisper_loaded
+    global _tts_model, _whisper_loaded, _last_interaction_time
     import mlx_whisper
     print("    Whisper STT...", end=" ", flush=True)
     mlx_whisper.transcribe(
@@ -832,6 +902,22 @@ def main():
     _tts_model = Kokoro(str(KOKORO_MODEL_PATH), str(KOKORO_VOICES_PATH))
     print("done")
 
+    print(f"    Ollama ({args.model})...", end=" ", flush=True)
+    try:
+        warmup_payload = {
+            "model": args.model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "think": False,
+            "keep_alive": "30m",
+            "options": {"num_predict": 1},
+        }
+        resp = httpx.post(OLLAMA_URL, json=warmup_payload, timeout=60.0)
+        resp.raise_for_status()
+        print("done")
+    except Exception as e:
+        print(f"warning: {e}")
+
     print(f"\n  Mode: {'Always-listening (VAD)' if vad_mode else 'Push-to-talk'}")
     print("  Ready.")
     play_chime(CHIME_WAKE)
@@ -839,9 +925,13 @@ def main():
     while True:
         try:
             if vad_mode:
-                if use_wake_word:
+                if not use_wake_word:
+                    result = _record_vad_no_wake()
+                elif _last_interaction_time == 0.0 or (time.time() - _last_interaction_time > IDLE_TIMEOUT):
+                    # No interaction yet or idle too long — require wake word
                     result = record_vad()
                 else:
+                    # Recent interaction — auto-listen (conversational mode)
                     result = _record_vad_no_wake()
             else:
                 result = record_push_to_talk()
@@ -922,6 +1012,8 @@ def main():
             messages.append({"role": "assistant", "content": response})
 
             tts_thread.join(timeout=60.0)
+
+            _last_interaction_time = time.time()
 
             handle_file_ops(response)
 
